@@ -264,5 +264,4 @@ g++ -shared -fPIC -o trinomial_model.so trinomial.cpp -std=c++17 -O3
 - `-std=c++17`: uses the C++17 standard.
 - `-O3`: maximum compiler optimization.
 
----
-*This README is intended for mathematicians and quantitative analysts who want to explore the trinomial model with local volatility without deep programming knowledge.*
+
