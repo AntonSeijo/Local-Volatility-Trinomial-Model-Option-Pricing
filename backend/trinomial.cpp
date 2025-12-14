@@ -30,13 +30,48 @@ static double sigma_at_step(int i, Params p) {
   return p.Theta[p.M - 1];
 }
 
+// Calculates a reference volatility (time-weighted average of Theta) to define
+// the fixed grid. This ensures u*d = 1 and provides a stable grid.
+static double calculate_sigma_ref(Params p) {
+  double sum_sigma = 0.0;
+  double total_time = 0.0;
+
+  if (p.M <= 0 || !p.Theta || !p.tau)
+    return 0.2; // Default fallback
+
+  for (int m = 0; m < p.M; m++) {
+    // Current interval duration: tau[m+1] - tau[m]
+    // Note: tau array has size M+1
+    double dt_interval = p.tau[m + 1] - p.tau[m];
+
+    if (dt_interval < 0)
+      dt_interval = 0; // Should not happen if tau is sorted
+
+    sum_sigma += p.Theta[m] * dt_interval;
+    total_time += dt_interval;
+  }
+
+  // If total time is 0 check p.T or return first theta
+  if (total_time <= 0.0) {
+    return (p.Theta[0] > 0) ? p.Theta[0] : 0.2;
+  }
+
+  return sum_sigma / total_time;
+}
+
 // Calculates trinomial transition probabilities (pu, pm, pd).
 // Ensures probabilities sum to 1 and are within [0, 1].
 // Based on standard discretization where V = sigma^2 * dt.
 static void trinomial_probs(double sigma_i, double r, double dt, double u,
                             double d, double *pu, double *pm, double *pd) {
   double M_factor = exp(r * dt);
+
+  // V is the variance over dt.
   double V = sigma_i * sigma_i * dt + M_factor * M_factor;
+
+  // prob_u = (V - M(d+1) + d) / ((u-1)(u-d))
+  // prob_d = (V - M(u+1) + u) / ((d-1)(d-u))
+  // prob_m = 1 - prob_u - prob_d
 
   double den_ud = (u - 1.0) * (u - d);
   double den_du = (d - 1.0) * (d - u);
@@ -46,6 +81,8 @@ static void trinomial_probs(double sigma_i, double r, double dt, double u,
   *pm = 1.0 - *pu - *pd;
 
   // Numerical correction to ensure valid probabilities
+  // With sigma_ref >= sigma_i, probabilities should generally be positive,
+  // but floating point issues or extreme r can cause slight violations.
   if (*pu < 0.0)
     *pu = 0.0;
   if (*pu > 1.0)
@@ -72,18 +109,17 @@ static void trinomial_probs(double sigma_i, double r, double dt, double u,
 // =========================================================
 
 // Builds the Price Tree (Forward Induction).
-// S_{i, j} = S0 * u^j
+// S_{i, j} = S0 * u^j using fixed u derived from sigma_ref
 static void buildPriceTree(Params p, double *PT) {
   if (!PT)
     return;
 
   double dt = p.T / p.N;
 
-  for (int i = 0; i <= p.N; i++) {
-    double sigma = sigma_at_step(i, p);
-    // Definition of u = exp(sigma * sqrt(2*dt)) for trinomial stability
-    double u = exp(sigma * sqrt(2.0 * dt));
+  double sigma_ref = calculate_sigma_ref(p);
+  double u = exp(sigma_ref * sqrt(2.0 * dt));
 
+  for (int i = 0; i <= p.N; i++) {
     for (int j = -i; j <= i; j++) {
       PT[idx(i, j, p.N)] = p.S0 * pow(u, j);
     }
@@ -100,6 +136,10 @@ static void buildValueTree(Params p, double *VT, double *PT) {
   double dt = p.T / p.N;
   double disc = exp(-p.r * dt); // Discount factor
 
+  double sigma_ref = calculate_sigma_ref(p);
+  double u = exp(sigma_ref * sqrt(2.0 * dt));
+  double d = 1.0 / u;
+
   // We need the Price Tree for:
   // 1. Payoff at maturity (t=T)
   // 2. Early exercise payoff (American)
@@ -112,10 +152,6 @@ static void buildValueTree(Params p, double *VT, double *PT) {
 
   // 1. Initialize final conditions at t=T (Maturity)
   {
-    double sigma_end = sigma_at_step(p.N, p);
-    // double u_end = exp(sigma_end * sqrt(2.0 * dt)); // Not used here, using
-    // PT
-
     for (int j = -p.N; j <= p.N; j++) {
 
       double S = PT[idx(p.N, j, p.N)];
@@ -128,12 +164,11 @@ static void buildValueTree(Params p, double *VT, double *PT) {
   // 2. Backward Induction from T-dt to 0
   for (int i = p.N - 1; i >= 0; i--) {
 
-    double sigma = sigma_at_step(i, p);
-    double u = exp(sigma * sqrt(2.0 * dt));
-    double d = 1.0 / u;
+    double sigma_local = sigma_at_step(i, p);
 
     double pu, pm, pd;
-    trinomial_probs(sigma, p.r, dt, u, d, &pu, &pm, &pd);
+    // CRITICAL: Compute probabilities using LOCAL sigma but FIXED grid (u, d)
+    trinomial_probs(sigma_local, p.r, dt, u, d, &pu, &pm, &pd);
 
     for (int j = -i; j <= i; j++) {
       // Continuation value (European)
@@ -159,29 +194,26 @@ static void buildValueTree(Params p, double *VT, double *PT) {
 }
 
 // Simplified pricer version for calibration.
-// Only calculates current price (V_{0,0}) without storing the full tree for
-// efficiency. USED INTERNALLY BY CALIBRATIONERROR.
+
 static double trinomialPricerOnly(Params p) {
   double dt = p.T / p.N;
   double disc = exp(-p.r * dt);
 
   int W = 2 * p.N + 1;
-  // We only need a vector for the current/next time slice,
-  // but using a full matrix for implementation simplicity given we
-  // already have the index logic. For max optimization, only 2 vectors would be
-  // used.
   double *V = (double *)malloc((p.N + 1) * W * sizeof(double));
 
   if (!V)
     return NAN;
 
+  double sigma_ref = calculate_sigma_ref(p);
+  double u = exp(sigma_ref * sqrt(2.0 * dt));
+  double d = 1.0 / u;
+
   // Final conditions
   {
-    double sigma_end = sigma_at_step(p.N, p);
-    double u_end = exp(sigma_end * sqrt(2.0 * dt));
-
+    // At T, calculating S is easy: S0 * u^j
     for (int j = -p.N; j <= p.N; j++) {
-      double S = p.S0 * pow(u_end, j); // Calculate S on the fly
+      double S = p.S0 * pow(u, j); // Calculate S on the fly using FIXED u
       double val = (p.type == CALL ? (S - p.K) : (p.K - S));
       V[idx(p.N, j, p.N)] = (val > 0) ? val : 0.0;
     }
@@ -190,12 +222,11 @@ static double trinomialPricerOnly(Params p) {
   // Backward steps
   for (int i = p.N - 1; i >= 0; i--) {
 
-    double sigma = sigma_at_step(i, p);
-    double u = exp(sigma * sqrt(2.0 * dt));
-    double d = 1.0 / u;
+    double sigma_local = sigma_at_step(i, p);
 
     double pu, pm, pd;
-    trinomial_probs(sigma, p.r, dt, u, d, &pu, &pm, &pd);
+    // Probabilities adapt to local sigma on fixed grid
+    trinomial_probs(sigma_local, p.r, dt, u, d, &pu, &pm, &pd);
 
     for (int j = -i; j <= i; j++) {
 
@@ -308,6 +339,23 @@ static double calibrationError(double *Theta, int M, double lambda,
 void nelderMead(double *ThetaStart, int M, double lambda, Params *tmpl,
                 double *Klist, double *Tlist, double *Vmarket, double *w,
                 int nOptions, int maxIter, double tol) {
+
+  // Normalize weights so they sum to 1.0
+  double sum_w = 0.0;
+  for (int i = 0; i < nOptions; i++) {
+    sum_w += w[i];
+  }
+
+  if (sum_w > 0.0) {
+    for (int i = 0; i < nOptions; i++) {
+      w[i] /= sum_w;
+    }
+  } else {
+    // Handle zero sum: Set uniform weights
+    double uniform = 1.0 / nOptions;
+    for (int i = 0; i < nOptions; i++)
+      w[i] = uniform;
+  }
 
   // Standard Nelder-Mead parameters
   double alpha = 1.0, gamma = 2.0, rho = 0.5, sigma = 0.5;
