@@ -6,7 +6,7 @@ Computational implementation of the trinomial model with local volatility for pr
 
 For a detailed explanation of the trinomial model and local volatility, refer to the mathematical documentation:
 
-**[Mathematical_Theory.pdf](./docs/Mathematical_Theory.pdf)** – Theoretical foundations of the trinomial model and local volatility.
+**[TTOptionPricer.pdf](./TTOptionPricer.pdf)** – Theoretical foundations of the trinomial model and local volatility.
 
 ## System Architecture
 
