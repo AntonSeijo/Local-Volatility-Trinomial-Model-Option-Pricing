@@ -215,7 +215,7 @@ Calibrates the local volatility parameters `θ` to match observed market option 
 │   ├── trinomial.hpp           # C++ headers
 │   ├── trinomial_model.so      # Compiled shared library
 │   ├── requirements.txt        # Python dependencies
-│   └── Dockerfile             # Container configuration
+│   └── dockerfile              # Container configuration
 │
 ├── frontend/
 │   ├── src/
@@ -224,13 +224,12 @@ Calibrates the local volatility parameters `θ` to match observed market option 
 │   │   └── main.jsx           # Entry point
 │   ├── package.json           # JS dependencies & scripts
 │   ├── vite.config.js         # Vite configuration
-│   ├── Dockerfile            # Container configuration
-│   └── nginx.conf            # Nginx config for production
+│   ├── dockerfile             # Container configuration
+│   └── nginx.conf             # Nginx config for production
 │
-├── docs/
-│   └── Mathematical_Theory.pdf  # Mathematical documentation
-│
-├── Architecture_diagram.jpeg    # Architecture diagram image
+├── TTOptionPricer.pdf          # Mathematical documentation
+├── Architecture_diagram.jpeg   # Architecture diagram image
+├── docker-compose.yml          # Docker orchestration
 └── README.md                   # This file (English version)
 ```
 
