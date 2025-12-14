@@ -312,6 +312,15 @@ static double calibrationError(double *Theta, int M, double lambda,
   Params p = *tmpl;
   p.Theta = Theta; // Use candidate Thetas
 
+  // CONSTRAINTS: Volatility must be non-negative.
+  // Although math works with sigma^2, negative sigma breaks tree geometry (u <
+  // 1).
+  for (int m = 0; m < M; m++) {
+    if (Theta[m] < 0.0) {
+      return 1.0e9; // Large penalty to reject this step
+    }
+  }
+
   for (int k = 0; k < nOptions; k++) {
     p.K = Klist[k];
     p.T = Tlist[k];
