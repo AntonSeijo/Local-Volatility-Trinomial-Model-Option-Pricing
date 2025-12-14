@@ -10,6 +10,19 @@ export default function ControlPanel({ params, handleChange, calculate, loading,
             className="glass-panel"
             style={{ padding: '1.5rem', height: 'fit-content' }}
         >
+            {/* Backend Disclaimer */}
+            <div style={{
+                backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                border: '1px solid rgba(59, 130, 246, 0.3)',
+                borderRadius: '8px',
+                padding: '0.75rem',
+                marginBottom: '1.5rem',
+                fontSize: '0.85rem',
+                color: '#94a3b8'
+            }}>
+                <strong style={{ color: '#3b82f6' }}>ℹ️ Note:</strong> The backend may take 30-60 seconds to boot up if it hasn't been used recently.
+            </div>
+
             <form onSubmit={calculate} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                     <div>
@@ -39,7 +52,9 @@ export default function ControlPanel({ params, handleChange, calculate, loading,
                     <small style={{ display: 'block', color: '#64748b', fontSize: '0.7rem', marginTop: 4 }}>
                         {Number(params.N) > 100
                             ? "Max N is 100"
-                            : "P&L Heatmap Visualization"}
+                            : Number(params.N) <= 10
+                                ? "Tree visualization available (N ≤ 10)"
+                                : "Reduced tree visualization (N > 10)"}
                     </small>
                 </div>
 
