@@ -6,7 +6,7 @@ Computational implementation of the trinomial model with local volatility for pr
 
 For a detailed explanation of the trinomial model and local volatility, refer to the mathematical documentation:
 
-**[TTOptionPricer.pdf](./TTOptionPricer.pdf)** – Theoretical foundations of the trinomial model and local volatility.
+**[TTPricer.pdf](./TTPricer.pdf)** – Theoretical foundations of the trinomial model and local volatility.
 
 ## System Architecture
 
@@ -263,5 +263,6 @@ g++ -shared -fPIC -o trinomial_model.so trinomial.cpp -std=c++17 -O3
 - `-fPIC`: position‑independent code (required for shared libs).
 - `-std=c++17`: uses the C++17 standard.
 - `-O3`: maximum compiler optimization.
+
 
 
