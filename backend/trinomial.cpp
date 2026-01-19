@@ -1,96 +1,134 @@
-#include "trinomial.hpp"
-#include <cfloat>  // For NAN
-#include <cmath>   // For exp, sqrt, pow, fabs
-#include <cstdio>  // For printf (if needed)
-#include <cstdlib> // For malloc, free
-#include <cstring> // For memcpy
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <algorithm>
+
+/**
+ * ============================================================================
+ * TRINOMIAL LOCAL VOLATILITY MODEL
+ * ============================================================================
+ * This engine calculates option prices (European/American) using a
+ * trinomial tree where volatility can change over time.
+ */
+
+enum OptionType { CALL = 0, PUT = 1 };
+
+// Main configuration structure sent from Python
+typedef struct {
+  double S0;      // Initial Spot
+  double r;       // Risk-free rate
+  double T;       // Time to maturity (years)
+  double K;       // Strike price
+  int isAmerican; // 1: American, 0: European
+  enum OptionType type;
+  int N;         // Number of time steps
+  int M;         // Number of volatility buckets
+  double *Theta; // Sigma values for each bucket
+  double *tau;   // Time boundaries for buckets
+} Params;
+
+// Results to export to Python
+typedef struct {
+  double price;      // Price at t=0
+  int N;             // Steps used
+  double *priceTree; // Asset price tree (flattened)
+  double *valueTree; // Option value tree (flattened)
+} TrinomialResults;
+
+// Internal structure to centralize Grid configuration
+// Avoids recalculating u, d, dt, and sigma_ref in multiple functions.
+typedef struct {
+  double dt;        // Delta t (T/N)
+  double u;         // Up factor
+  double d;         // Down factor
+  double disc;      // Discount factor e^(-r*dt)
+  double sigma_ref; // Reference volatility for the fixed grid
+} GridConfig;
 
 // =========================================================
-// Helper Functions
+// HELPER FUNCTIONS
 // =========================================================
 
-// Calculates linear index for a node (i, j) in a flattened array.
-// i: time step (0 to N)
-// j: vertical position (-i to i)
-// The trinomial tree has width 2*i + 1 at step i.
-// For memory simplicity, we use a fixed maximum width of 2*N + 1.
+/**
+ * idx: Calculates linear index in a 1D array to simulate a 2D matrix.
+ * i: Time step (0 to N). Horizontal axis.
+ * j: Price vertical level (-i to i). Vertical axis.
+ * N: Total resolution.
+ *
+ * Geometry: At step i, the tree has 2*i + 1 nodes.
+ * We use a fixed width of 2*N + 1 to simplify access.
+ */
 static inline int idx(int i, int j, int N) { return i * (2 * N + 1) + (j + N); }
 
-// Gets the local volatility sigma(t) corresponding to step i.
-// Finds in which time interval [tau_m, tau_{m+1}) the time t = i*dt falls.
+/**
+ * sigma_at_step: Selects local volatility Theta[m] for current time t.
+ * Implements the local volatility term structure.
+ */
 static double sigma_at_step(int i, Params p) {
-  double dt = p.T / p.N;
-  double t = i * dt;
-
+  double t = i * (p.T / p.N);
   for (int m = 0; m < p.M; m++) {
-    if (t >= p.tau[m] && t < p.tau[m + 1]) {
+    if (t >= p.tau[m] && t < p.tau[m + 1])
       return p.Theta[m];
-    }
   }
-  return p.Theta[p.M - 1];
+  return p.Theta[p.M - 1]; // Fallback to last bucket
 }
 
-// Calculates a reference volatility (time-weighted average of Theta) to define
-// the fixed grid. This ensures u*d = 1 and provides a stable grid.
+/**
+ * calculate_sigma_ref: Calculates weighted average of volatility.
+ * Used to define a fixed grid (Fixed Grid) that is stable.
+ */
 static double calculate_sigma_ref(Params p) {
-  double sum_sigma = 0.0;
-  double total_time = 0.0;
-
-  if (p.M <= 0 || !p.Theta || !p.tau)
-    return 0.2; // Default fallback
-
+  double sum_sigma = 0.0, total_time = 0.0;
+  if (p.M <= 0)
+    return 0.2;
   for (int m = 0; m < p.M; m++) {
-    // Current interval duration: tau[m+1] - tau[m]
-    // Note: tau array has size M+1
     double dt_interval = p.tau[m + 1] - p.tau[m];
-
-    if (dt_interval < 0)
-      dt_interval = 0; // Should not happen if tau is sorted
-
-    sum_sigma += p.Theta[m] * dt_interval;
+    sum_sigma += p.Theta[m] * (dt_interval < 0 ? 0 : dt_interval);
     total_time += dt_interval;
   }
-
-  // If total time is 0 check p.T or return first theta
-  if (total_time <= 0.0) {
-    return (p.Theta[0] > 0) ? p.Theta[0] : 0.2;
-  }
-
-  return sum_sigma / total_time;
+  return (total_time <= 0.0) ? p.Theta[0] : sum_sigma / total_time;
 }
 
-// Calculates trinomial transition probabilities (pu, pm, pd).
-// Ensures probabilities sum to 1 and are within [0, 1].
-// Based on standard discretization where V = sigma^2 * dt.
+/**
+ * get_grid_config: Precalculates constant grid parameters.
+ * u = e^(sigma_ref * sqrt(2*dt)) ensures the tree is recombinant and trinomial.
+ */
+static GridConfig get_grid_config(Params p) {
+  GridConfig cfg;
+  cfg.dt = p.T / p.N;
+  cfg.disc = exp(-p.r * cfg.dt);
+  cfg.sigma_ref = calculate_sigma_ref(p);
+  cfg.u = exp(cfg.sigma_ref * sqrt(2.0 * cfg.dt));
+  cfg.d = 1.0 / cfg.u;
+  return cfg;
+}
+
+/**
+ * trinomial_probs: Solves probability math at each node.
+ * pu, pm, pd are calculated to match mean (r) and variance (sigma_local).
+ */
 static void trinomial_probs(double sigma_i, double r, double dt, double u,
                             double d, double *pu, double *pm, double *pd) {
   double M_factor = exp(r * dt);
+  double V = sigma_i * sigma_i * dt + M_factor * M_factor; // Expected E[S^2]
 
-  // V is the variance over dt.
-  double V = sigma_i * sigma_i * dt + M_factor * M_factor;
+  // Risk-neutral consistency formulas
+  *pu = (V - M_factor * (d + 1.0) + d) / ((u - 1.0) * (u - d));
+  *pd = (V - M_factor * (u + 1.0) + u) / ((d - 1.0) * (d - u));
+  
 
-  // prob_u = (V - M(d+1) + d) / ((u-1)(u-d))
-  // prob_d = (V - M(u+1) + u) / ((d-1)(d-u))
-  // prob_m = 1 - prob_u - prob_d
-
-  double den_ud = (u - 1.0) * (u - d);
-  double den_du = (d - 1.0) * (d - u);
-
-  *pu = (V - M_factor * (d + 1.0) + d) / den_ud;
-  *pd = (V - M_factor * (u + 1.0) + u) / den_du;
-  *pm = 1.0 - *pu - *pd;
-
-  // Numerical correction to ensure valid probabilities
-  // With sigma_ref >= sigma_i, probabilities should generally be positive,
-  // but floating point issues or extreme r can cause slight violations.
-  if (*pu < 0.0)
-    *pu = 0.0;
-  if (*pu > 1.0)
-    *pu = 1.0;
-  if (*pd < 0.0)
-    *pd = 0.0;
-  if (*pd > 1.0)
-    *pd = 1.0;
+  // Numerical corrections to keep probabilities in [0, 1]
+  if (*pu < 0)
+    *pu = 0;
+  if (*pu > 1)
+    *pu = 1;
+  if (*pd < 0)
+    *pd = 0;
+  if (*pd > 1)
+    *pd = 1;
 
   *pm = 1.0 - *pu - *pd;
 
@@ -104,425 +142,256 @@ static void trinomial_probs(double sigma_i, double r, double dt, double u,
   }
 }
 
-// =========================================================
-// Trinomial Tree Logic
-// =========================================================
-
-// Builds the Price Tree (Forward Induction).
-// S_{i, j} = S0 * u^j using fixed u derived from sigma_ref
-static void buildPriceTree(Params p, double *PT) {
-  if (!PT)
-    return;
-
-  double dt = p.T / p.N;
-
-  double sigma_ref = calculate_sigma_ref(p);
-  double u = exp(sigma_ref * sqrt(2.0 * dt));
-
-  for (int i = 0; i <= p.N; i++) {
-    for (int j = -i; j <= i; j++) {
-      PT[idx(i, j, p.N)] = p.S0 * pow(u, j);
-    }
-  }
+static inline double calculate_payoff(double S, double K,
+                                      enum OptionType type) {
+  double val = (type == CALL ? (S - K) : (K - S));
+  return (val > 0) ? val : 0.0;
 }
 
-// Calculates the Option Value Tree (Backward Induction).
-// V_{i, j} = DF * (pu*V_{i+1, j+1} + pm*V_{i+1, j} + pd*V_{i+1, j-1})
-static void buildValueTree(Params p, double *VT, double *PT) {
+// =========================================================
+// INDUCTION ENGINE
+// =========================================================
 
-  if (!VT)
-    return;
-
-  double dt = p.T / p.N;
-  double disc = exp(-p.r * dt); // Discount factor
-
-  double sigma_ref = calculate_sigma_ref(p);
-  double u = exp(sigma_ref * sqrt(2.0 * dt));
-  double d = 1.0 / u;
-
-  // We need the Price Tree for:
-  // 1. Payoff at maturity (t=T)
-  // 2. Early exercise payoff (American)
-  double *localPT = nullptr;
-  if (!PT) {
-    localPT = (double *)malloc((p.N + 1) * (2 * p.N + 1) * sizeof(double));
-    buildPriceTree(p, localPT);
-    PT = localPT;
+/**
+ * computeValueInduction: The heart of the model.
+ * Used for both generating the full tree and fast calibration.
+ *
+ * PT (PriceTree): If null, prices calculated on the fly (saves memory).
+ * VT (ValueTree): Array where option values will be stored.
+ */
+static void computeValueInduction(Params p, GridConfig cfg, double *VT,
+                                  double *PT) {
+  // 1. Final Condition at T (Maturity)
+  for (int j = -p.N; j <= p.N; j++) {
+    double S = PT ? PT[idx(p.N, j, p.N)] : (p.S0 * pow(cfg.u, j));
+    VT[idx(p.N, j, p.N)] = calculate_payoff(S, p.K, p.type);
   }
 
-  // 1. Initialize final conditions at t=T (Maturity)
-  {
-    for (int j = -p.N; j <= p.N; j++) {
-
-      double S = PT[idx(p.N, j, p.N)];
-
-      double val = (p.type == CALL ? (S - p.K) : (p.K - S));
-      VT[idx(p.N, j, p.N)] = (val > 0) ? val : 0.0;
-    }
-  }
-
-  // 2. Backward Induction from T-dt to 0
+  // 2. Backward Induction (Future to Present)
   for (int i = p.N - 1; i >= 0; i--) {
-
     double sigma_local = sigma_at_step(i, p);
-
     double pu, pm, pd;
-    // CRITICAL: Compute probabilities using LOCAL sigma but FIXED grid (u, d)
-    trinomial_probs(sigma_local, p.r, dt, u, d, &pu, &pm, &pd);
+    trinomial_probs(sigma_local, p.r, cfg.dt, cfg.u, cfg.d, &pu, &pm, &pd);
 
     for (int j = -i; j <= i; j++) {
-      // Continuation value (European)
-      double cont = disc * (pu * VT[idx(i + 1, j + 1, p.N)] +
-                            pm * VT[idx(i + 1, j, p.N)] +
-                            pd * VT[idx(i + 1, j - 1, p.N)]);
+      // Continuation value (Discounted Risk-Neutral Expectation)
+      double cont = cfg.disc * (pu * VT[idx(i + 1, j + 1, p.N)] +
+                                pm * VT[idx(i + 1, j, p.N)] +
+                                pd * VT[idx(i + 1, j - 1, p.N)]);
 
-      // Check early exercise for American Option
       if (p.isAmerican) {
-        double S_node = PT[idx(i, j, p.N)];
-        double intr = (p.type == CALL ? (S_node - p.K) : (p.K - S_node));
-        if (intr < 0)
-          intr = 0;
-        VT[idx(i, j, p.N)] = (cont > intr) ? cont : intr;
+        double S = PT ? PT[idx(i, j, p.N)] : (p.S0 * pow(cfg.u, j));
+        double exercise = calculate_payoff(S, p.K, p.type);
+        VT[idx(i, j, p.N)] = (cont > exercise) ? cont : exercise;
       } else {
         VT[idx(i, j, p.N)] = cont;
       }
     }
   }
-
-  if (localPT)
-    free(localPT);
 }
 
-// Simplified pricer version for calibration.
-
+// Lightweight pricing version for calibration (returns only price at t=0)
 static double trinomialPricerOnly(Params p) {
-  double dt = p.T / p.N;
-  double disc = exp(-p.r * dt);
+  GridConfig cfg = get_grid_config(p);
+  // Use std::vector for automatic memory management (RAII)
+  std::vector<double> V((p.N + 1) * (2 * p.N + 1));
+  
+  computeValueInduction(
+      p, cfg, V.data(),
+      nullptr); // Pass nullptr to avoid dependency on physical PriceTree
 
-  int W = 2 * p.N + 1;
-  double *V = (double *)malloc((p.N + 1) * W * sizeof(double));
-
-  if (!V)
-    return NAN;
-
-  double sigma_ref = calculate_sigma_ref(p);
-  double u = exp(sigma_ref * sqrt(2.0 * dt));
-  double d = 1.0 / u;
-
-  // Final conditions
-  {
-    // At T, calculating S is easy: S0 * u^j
-    for (int j = -p.N; j <= p.N; j++) {
-      double S = p.S0 * pow(u, j); // Calculate S on the fly using FIXED u
-      double val = (p.type == CALL ? (S - p.K) : (p.K - S));
-      V[idx(p.N, j, p.N)] = (val > 0) ? val : 0.0;
-    }
-  }
-
-  // Backward steps
-  for (int i = p.N - 1; i >= 0; i--) {
-
-    double sigma_local = sigma_at_step(i, p);
-
-    double pu, pm, pd;
-    // Probabilities adapt to local sigma on fixed grid
-    trinomial_probs(sigma_local, p.r, dt, u, d, &pu, &pm, &pd);
-
-    for (int j = -i; j <= i; j++) {
-
-      double cont =
-          disc * (pu * V[idx(i + 1, j + 1, p.N)] + pm * V[idx(i + 1, j, p.N)] +
-                  pd * V[idx(i + 1, j - 1, p.N)]);
-
-      if (p.isAmerican) {
-        double S = p.S0 * pow(u, j);
-        double intr = (p.type == CALL ? (S - p.K) : (p.K - S));
-        if (intr < 0)
-          intr = 0;
-        V[idx(i, j, p.N)] = (cont > intr) ? cont : intr;
-      } else {
-        V[idx(i, j, p.N)] = cont;
-      }
-    }
-  }
-
-  double res = V[idx(0, 0, p.N)];
-  free(V);
-  return res;
+  return V[idx(0, 0, p.N)];
 }
 
-// =========================================================
-// Exported Functions (API)
-// =========================================================
+extern "C" {
 
-// Main Function: Runs the full model and returns structures.
-// Used by /price and /tree endpoints.
+// Main entry point for /tree endpoint
 TrinomialResults runTrinomialModel(Params p) {
-  TrinomialResults res;
-  res.N = p.N;
+  TrinomialResults res = {0, p.N, nullptr, nullptr};
+  GridConfig cfg = get_grid_config(p);
   int size = (p.N + 1) * (2 * p.N + 1);
 
-  // Allocate memory for trees
-  res.priceTree = (double *)malloc(size * sizeof(double));
-  res.valueTree = (double *)malloc(size * sizeof(double));
-
-  if (!res.priceTree || !res.valueTree) {
-    if (res.priceTree)
-      free(res.priceTree);
-    if (res.valueTree)
-      free(res.valueTree);
-    res.price = NAN;
+  try {
+    res.priceTree = new double[size];
+    res.valueTree = new double[size];
+  } catch(const std::bad_alloc&) {
+    if (res.priceTree) delete[] res.priceTree;
+    if (res.valueTree) delete[] res.valueTree;
     res.priceTree = nullptr;
     res.valueTree = nullptr;
     return res;
   }
 
-  // Build trees
-  buildPriceTree(p, res.priceTree);
-  buildValueTree(p, res.valueTree, res.priceTree);
-
-  // Option price is the value at the root (t=0, j=0)
-  res.price = res.valueTree[idx(0, 0, p.N)];
-
+  if (res.priceTree && res.valueTree) {
+    // A. Price Tree Construction (Forward)
+    for (int i = 0; i <= p.N; i++) {
+      for (int j = -i; j <= i; j++) {
+        res.priceTree[idx(i, j, p.N)] = p.S0 * pow(cfg.u, j);
+      }
+    }
+    // B. Value Tree Construction (Backward)
+    computeValueInduction(p, cfg, res.valueTree, res.priceTree);
+    res.price = res.valueTree[idx(0, 0, p.N)];
+  }
   return res;
 }
 
-// Releases memory of results returned to Python/API.
 void freeTrinomialResults(TrinomialResults *res) {
-  if (res && res->priceTree) {
-    free(res->priceTree);
+  if (res->priceTree) {
+    delete[] res->priceTree;
     res->priceTree = nullptr;
   }
-  if (res && res->valueTree) {
-    free(res->valueTree);
+  if (res->valueTree) {
+    delete[] res->valueTree;
     res->valueTree = nullptr;
   }
 }
 
 // =========================================================
-// Calibration (Local Volatility)
+// CALIBRATION (NELDER-MEAD)
 // =========================================================
 
-// Objective Function: Squared Error + Penalty (Smoothing).
-// E(Theta) = sum(w * (Model - Market)^2) + lambda * penalty
+
 static double calibrationError(double *Theta, int M, double lambda,
                                Params *tmpl, double *Klist, double *Tlist,
-                               double *Vmarket, double *w, int nOptions) {
-  double sse = 0.0;
+                               double *Vmarket, int nOptions) {
+  double sse = 0.0, penalty = 0.0;
   Params p = *tmpl;
-  p.Theta = Theta; // Use candidate Thetas
+  p.Theta = Theta;
 
-  // CONSTRAINTS: Volatility must be non-negative.
-  // Although math works with sigma^2, negative sigma breaks tree geometry (u <
-  // 1).
-  for (int m = 0; m < M; m++) {
-    if (Theta[m] < 0.0) {
-      return 1.0e9; // Large penalty to reject this step
-    }
-  }
+  for (int m = 0; m < M; m++)
+    if (Theta[m] < 0.0)
+      return 1e9; // Penalty for negative sigma
 
   for (int k = 0; k < nOptions; k++) {
     p.K = Klist[k];
     p.T = Tlist[k];
-    p.isAmerican = 0; // Assume calibration with liquid European options
-
-    // Use optimized pricer (no tree storage)
-    double modelPrice = trinomialPricerOnly(p);
-    double diff = modelPrice - Vmarket[k];
-    sse += w[k] * (diff * diff);
+    double model_price = trinomialPricerOnly(p);
+    double diff = model_price - Vmarket[k];
+    sse += diff * diff;
   }
 
-  // Penalty for excessive volatility variation (Tikhonov variational
-  // regularization)
-  double penalty = 0.0;
+  // Penalize sharp jumps in temporal volatility
   for (int m = 0; m < M - 1; m++) {
     double d = Theta[m + 1] - Theta[m];
     penalty += d * d;
   }
-
-  return sse + lambda * penalty;
+  return sse/nOptions + lambda * penalty;
 }
 
-// Nelder-Mead Algorithm (Simplex) to minimize calibration error.
-// Finds optimal Theta vector.
 void nelderMead(double *ThetaStart, int M, double lambda, Params *tmpl,
-                double *Klist, double *Tlist, double *Vmarket, double *w,
+                double *Klist, double *Tlist, double *Vmarket,
                 int nOptions, int maxIter, double tol) {
-
-  // Normalize weights so they sum to 1.0
-  double sum_w = 0.0;
-  for (int i = 0; i < nOptions; i++) {
-    sum_w += w[i];
-  }
-
-  if (sum_w > 0.0) {
-    for (int i = 0; i < nOptions; i++) {
-      w[i] /= sum_w;
-    }
-  } else {
-    // Handle zero sum: Set uniform weights
-    double uniform = 1.0 / nOptions;
-    for (int i = 0; i < nOptions; i++)
-      w[i] = uniform;
-  }
-
-  // Standard Nelder-Mead parameters
+  int n = M, n_pts = n + 1;
   double alpha = 1.0, gamma = 2.0, rho = 0.5, sigma = 0.5;
 
-  int n = M;            // Problem dimension (number of volatility buckets)
-  int n_points = n + 1; // Points in simplex
+  std::vector<std::vector<double>> simplex(n_pts, std::vector<double>(n));
+  std::vector<double> scores(n_pts);
 
-  // Memory allocation for simplex
-  double **simplex = (double **)malloc(n_points * sizeof(double *));
-  double *scores = (double *)malloc(n_points * sizeof(double));
-
-  // Initial point (ThetaStart provided by user)
-  simplex[0] = (double *)malloc(n * sizeof(double));
-  memcpy(simplex[0], ThetaStart, n * sizeof(double));
-  scores[0] = calibrationError(simplex[0], n, lambda, tmpl, Klist, Tlist,
-                               Vmarket, w, nOptions);
-
-  // Generate remaining initial points by perturbing each dimension
-  for (int i = 1; i < n_points; i++) {
-    simplex[i] = (double *)malloc(n * sizeof(double));
-    memcpy(simplex[i], ThetaStart, n * sizeof(double));
-    // Perturbation of 5% or 0.01 absolute if zero
-    double step = (simplex[i][i - 1] != 0) ? simplex[i][i - 1] * 0.05 : 0.01;
-    simplex[i][i - 1] += step;
-    scores[i] = calibrationError(simplex[i], n, lambda, tmpl, Klist, Tlist,
-                                 Vmarket, w, nOptions);
+  // 1. Simplex Initialization
+  for (int i = 0; i < n_pts; i++) {
+    // Copy from initial array or perturb
+    if (i == 0) {
+        for(int k=0; k<n; k++) simplex[i][k] = ThetaStart[k];
+    } else {
+        for(int k=0; k<n; k++) {
+            simplex[i][k] = ThetaStart[k];
+            if (k == i - 1) {
+                simplex[i][k] += (simplex[i][k] != 0 ? simplex[i][k] * 0.05 : 0.01);
+            }
+        }
+    }
+    scores[i] = calibrationError(simplex[i].data(), n, lambda, tmpl, Klist, Tlist, Vmarket, nOptions);
   }
 
-  // Temp buffers for transformed points
-  double *centroid = (double *)malloc(n * sizeof(double));
-  double *reflected = (double *)malloc(n * sizeof(double));
-  double *expanded = (double *)malloc(n * sizeof(double));
-  double *contracted = (double *)malloc(n * sizeof(double));
+  std::vector<double> centroid(n);
+  std::vector<double> reflected(n);
+  std::vector<double> expanded(n);
+  std::vector<double> contracted(n);
 
-  // Main Optimization Loop
+  // 2. Optimization Loop
+  std::vector<int> idxs(n_pts);
+
   for (int iter = 0; iter < maxIter; iter++) {
-    // 1. Sort by score (Bubble sort for simplicity with small N)
-    int indices[n_points];
-    for (int i = 0; i < n_points; i++)
-      indices[i] = i;
+    // Sort candidates
+    for (int i = 0; i < n_pts; i++)
+      idxs[i] = i;
+    
+    std::sort(idxs.begin(), idxs.end(), [&](int a, int b) {
+        return scores[a] < scores[b];
+    });
 
-    for (int i = 0; i < n_points - 1; i++) {
-      for (int j = 0; j < n_points - i - 1; j++) {
-        if (scores[indices[j]] > scores[indices[j + 1]]) {
-          int temp = indices[j];
-          indices[j] = indices[j + 1];
-          indices[j + 1] = temp;
+    if (fabs(scores[idxs[n]] - scores[idxs[0]]) < tol)
+      break;
+
+    // Calculate Centroid (average of best n points)
+    for (int j = 0; j < n; j++) {
+      centroid[j] = 0;
+      for (int i = 0; i < n; i++)
+        centroid[j] += simplex[idxs[i]][j];
+      centroid[j] /= n;
+    }
+
+    int worst = idxs[n];
+    // Reflect worst point
+    for (int j = 0; j < n; j++)
+      reflected[j] = centroid[j] + alpha * (centroid[j] - simplex[worst][j]);
+    double r_score = calibrationError(reflected.data(), n, lambda, tmpl, Klist, Tlist,
+                                      Vmarket, nOptions);
+
+    if (r_score < scores[idxs[n - 1]] && r_score >= scores[idxs[0]]) {
+      simplex[worst] = reflected; // Direct copy
+      scores[worst] = r_score;
+    } else if (r_score < scores[idxs[0]]) {
+      // Try Expansion
+      for (int j = 0; j < n; j++)
+        expanded[j] = centroid[j] + gamma * (reflected[j] - centroid[j]);
+      double e_score = calibrationError(expanded.data(), n, lambda, tmpl, Klist, Tlist,
+                                        Vmarket, nOptions);
+      if (e_score < r_score) {
+        simplex[worst] = expanded;
+        scores[worst] = e_score;
+      } else {
+        simplex[worst] = reflected;
+        scores[worst] = r_score;
+      }
+    } else {
+      // Try Contraction
+      for (int j = 0; j < n; j++) {
+        double val = (r_score < scores[worst] ? reflected[j] : simplex[worst][j]);
+        contracted[j] = centroid[j] + rho * (val - centroid[j]);
+      }
+      double c_score = calibrationError(contracted.data(), n, lambda, tmpl, Klist,
+                                        Tlist, Vmarket, nOptions);
+      if (c_score < scores[idxs[n]]) {
+        simplex[worst] = contracted;
+        scores[worst] = c_score;
+      } else {
+        // Shrink
+        for (int i = 1; i < n_pts; i++) {
+            // idxs[0] is best
+            int current_idx = idxs[i];
+            int best_idx = idxs[0];
+            for (int j = 0; j < n; j++) {
+                 simplex[current_idx][j] = simplex[best_idx][j] +
+                                          sigma * (simplex[current_idx][j] - simplex[best_idx][j]);
+            }
+          scores[current_idx] =
+              calibrationError(simplex[current_idx].data(), n, lambda, tmpl, Klist, Tlist,
+                               Vmarket, nOptions);
         }
       }
     }
-
-    // Convergence check
-    double best_score = scores[indices[0]];
-    double worst_score = scores[indices[n]];
-    if (fabs(worst_score - best_score) < tol)
-      break;
-
-    // 2. Calculate Centroid (excluding worst point)
-    for (int j = 0; j < n; j++)
-      centroid[j] = 0.0;
-    for (int i = 0; i < n; i++) {
-      int idx_p = indices[i];
-      for (int j = 0; j < n; j++)
-        centroid[j] += simplex[idx_p][j];
-    }
-    for (int j = 0; j < n; j++)
-      centroid[j] /= n;
-
-    int worst_idx = indices[n];
-
-    // 3. Reflect
-    for (int j = 0; j < n; j++)
-      reflected[j] =
-          centroid[j] + alpha * (centroid[j] - simplex[worst_idx][j]);
-    double reflected_score = calibrationError(reflected, n, lambda, tmpl, Klist,
-                                              Tlist, Vmarket, w, nOptions);
-
-    if (reflected_score >= scores[indices[0]] &&
-        reflected_score < scores[indices[n - 1]]) {
-      memcpy(simplex[worst_idx], reflected, n * sizeof(double));
-      scores[worst_idx] = reflected_score;
-      continue;
-    }
-
-    // 4. Expand
-    if (reflected_score < scores[indices[0]]) {
-      for (int j = 0; j < n; j++)
-        expanded[j] = centroid[j] + gamma * (reflected[j] - centroid[j]);
-      double expanded_score = calibrationError(expanded, n, lambda, tmpl, Klist,
-                                               Tlist, Vmarket, w, nOptions);
-
-      if (expanded_score < reflected_score) {
-        memcpy(simplex[worst_idx], expanded, n * sizeof(double));
-        scores[worst_idx] = expanded_score;
-      } else {
-        memcpy(simplex[worst_idx], reflected, n * sizeof(double));
-        scores[worst_idx] = reflected_score;
-      }
-      continue;
-    }
-
-    // 5. Contract
-    if (reflected_score < scores[indices[n]]) {
-      // Outside Contraction
-      for (int j = 0; j < n; j++)
-        contracted[j] = centroid[j] + rho * (reflected[j] - centroid[j]);
-      double contracted_score = calibrationError(
-          contracted, n, lambda, tmpl, Klist, Tlist, Vmarket, w, nOptions);
-      if (contracted_score < reflected_score) {
-        memcpy(simplex[worst_idx], contracted, n * sizeof(double));
-        scores[worst_idx] = contracted_score;
-        continue;
-      }
-    } else {
-      // Inside Contraction
-      for (int j = 0; j < n; j++)
-        contracted[j] =
-            centroid[j] + rho * (simplex[worst_idx][j] - centroid[j]);
-      double contracted_score = calibrationError(
-          contracted, n, lambda, tmpl, Klist, Tlist, Vmarket, w, nOptions);
-      if (contracted_score < scores[indices[n]]) {
-        memcpy(simplex[worst_idx], contracted, n * sizeof(double));
-        scores[worst_idx] = contracted_score;
-        continue;
-      }
-    }
-
-    // 6. Shrink entire simplex towards best point
-    int best_idx = indices[0];
-    for (int i = 1; i < n_points; i++) {
-      int idx_p = indices[i];
-      for (int j = 0; j < n; j++) {
-        simplex[idx_p][j] = simplex[best_idx][j] +
-                            sigma * (simplex[idx_p][j] - simplex[best_idx][j]);
-      }
-      scores[idx_p] = calibrationError(simplex[idx_p], n, lambda, tmpl, Klist,
-                                       Tlist, Vmarket, w, nOptions);
-    }
   }
 
-  // Copy best result to ThetaStart (output)
-  int final_best_idx = 0;
-  double min_s = scores[0];
-  for (int i = 1; i < n_points; i++) {
-    if (scores[i] < min_s) {
-      min_s = scores[i];
-      final_best_idx = i;
-    }
-  }
-  memcpy(ThetaStart, simplex[final_best_idx], n * sizeof(double));
+  // Return best result found
+  int best = 0;
+  for (int i = 1; i < n_pts; i++)
+    if (scores[i] < scores[best])
+      best = i;
+  
+  for(int k=0; k<n; k++) ThetaStart[k] = simplex[best][k];
 
-  // Memory Cleanup
-  for (int i = 0; i < n_points; i++)
-    free(simplex[i]);
-  free(simplex);
-  free(scores);
-  free(centroid);
-  free(reflected);
-  free(expanded);
-  free(contracted);
 }
+
+} 
