@@ -121,7 +121,6 @@ Calibrates the local volatility parameters `θ` to match observed market option 
 - `Theta_initial`: Initial guess for the `θ` values.
 - `tau`: Time points `[τ₀, …, τₘ]`.
 - `Klist`, `Tlist`, `Vmarket`: Lists of strikes, maturities, and observed market prices.
-- `weights` (optional): Weights for each observation in the loss function.
 - `lambda_penalty`: Regularization parameter to penalize extreme volatilities.
 - `max_iter`: Maximum number of Nelder‑Mead iterations.
 - `tolerance`: Convergence tolerance.
@@ -138,7 +137,6 @@ Calibrates the local volatility parameters `θ` to match observed market option 
   "Klist": [95.0, 100.0, 105.0, 100.0, 100.0],
   "Tlist": [1.0, 1.0, 1.0, 0.5, 1.5],
   "Vmarket": [12.5, 10.4, 8.2, 7.1, 13.2],
-  "weights": [1.0, 1.0, 1.0, 1.0, 1.0],
   "lambda_penalty": 0.01,
   "max_iter": 500,
   "tolerance": 1e-6
@@ -178,13 +176,13 @@ Calibrates the local volatility parameters `θ` to match observed market option 
 
 ### Calibration
 - Uses the Nelder‑Mead simplex method.
-- **Objective**: Weighted squared error between model prices and market prices.
+- **Objective**: Minimize the Mean Squared Error (MSE) between model prices and market prices. It is particularly effective for long-dated instruments, as it incorporates the market's volatility term structure instead of assuming a constant parameter.
 - **Regularization**: Penalty term `λ` prevents extreme volatility values.
 - **Convergence**: Typically converges within 100‑500 iterations.
 - **Tip**: Start with reasonable initial volatilities (e.g., `θᵢ ≈ 0.20`).
 
 ### Computational Limits
-- Tree visualization is optimized for `N ≤ 15` (the tree contains `3^N` total nodes).
+- Tree visualization is optimized for `N ≤ 15` (the tree contains $(N+1)^2$ total nodes).
 - Pure calculations can handle much larger `N` (hundreds of steps).
 
 ## Technology Stack
@@ -227,7 +225,7 @@ Calibrates the local volatility parameters `θ` to match observed market option 
 │   ├── dockerfile             # Container configuration
 │   └── nginx.conf             # Nginx config for production
 │
-├── TTOptionPricer.pdf          # Mathematical documentation
+├── TTPricer.pdf                # Mathematical documentation
 ├── Architecture_diagram.jpeg   # Architecture diagram image
 ├── docker-compose.yml          # Docker orchestration
 └── README.md                   # This file (English version)
@@ -263,6 +261,7 @@ g++ -shared -fPIC -o trinomial_model.so trinomial.cpp -std=c++17 -O3
 - `-fPIC`: position‑independent code (required for shared libs).
 - `-std=c++17`: uses the C++17 standard.
 - `-O3`: maximum compiler optimization.
+
 
 
 
